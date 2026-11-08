@@ -95,6 +95,14 @@ async Task Handle(CourseMessage m)
         var reason = senderOk ? c.Reason : $"unknown sender '{m.From}'";
         store.Event("checked", new { m.Id, acts = c.Acts, act = c.Act, label, reason });
 
+        // No act asked for, from a known sender: nothing to run and nothing to approve, so just answer.
+        if (senderOk && c.Acts.Length == 0)
+        {
+            store.Event("no-act", new { m.Id });
+            await Reply(m, "Up and running. This message asks for no act, so I did nothing. My human is away; anything gated waits for them.");
+            return;
+        }
+
         if (label == "free" && c.Act is not null)
         {
             var result = Acts.Run(c.Act, m.Text);
@@ -227,6 +235,14 @@ app.MapGet("/admin/log", (HttpRequest req) => IsAdmin(req) ? Results.Text(store.
 app.MapGet("/admin/holds", (HttpRequest req) => IsAdmin(req)
     ? Results.Json(store.Holds.Values.Select(h => new { h.Id, h.State, h.Act, h.Candidates, h.Reason, h.CreatedAt, h.Message.From, h.Message.Text }))
     : Results.StatusCode(401));
+app.MapPost("/admin/cancel/{id}", (string id, HttpRequest req) =>
+{
+    if (!IsAdmin(req)) return Results.StatusCode(401);
+    if (!store.Holds.TryGetValue(id, out var h)) return Results.NotFound();
+    lock (h) { if (h.State == "held") h.State = "cancelled"; }
+    store.Event("cancelled", new { hold = id, h.State });
+    return Results.Ok(new { h.Id, h.State });
+});
 app.MapPost("/admin/ping-test", async (HttpRequest req) =>
 {
     if (!IsAdmin(req)) return Results.StatusCode(401);
