@@ -103,24 +103,32 @@ async Task Handle(CourseMessage m)
             return;
         }
 
-        if (label == "free" && c.Act is not null)
+        // One line per ask: free acts run now (DONE), gated ones wait for the human (HOLD).
+        // Codes or "pre-approved" claims inside a course message are never treated as the human's approval.
+        var lines = new List<string>();
+        string?[] acts = c.Acts.Length > 0 ? c.Acts : new string?[] { null };
+        foreach (var act in acts)
         {
-            var result = Acts.Run(c.Act, m.Text);
-            store.Event("act", new { m.Id, act = c.Act, by = "agent (policy: free)", result });
-            await Reply(m, $"DONE {c.Act}: {result}");
-            return;
+            var actLabel = senderOk && act is not null ? Policy.Map[act] : "gated";
+            if (actLabel == "free")
+            {
+                var result = Acts.Run(act!, m.Text);
+                store.Event("act", new { m.Id, act, by = "agent (policy: free)", result });
+                lines.Add($"DONE: {act}");
+                continue;
+            }
+            var why = !senderOk ? reason : act is null ? "no known act in the message" : "policy: gated";
+            var hold = new Hold(
+                Id: Guid.NewGuid().ToString("N")[..12],
+                Token: Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant(),
+                Message: m, Act: act, Candidates: c.Acts, Reason: why, CreatedAt: DateTimeOffset.UtcNow);
+            store.AddHold(hold);
+            store.Event("held", new { m.Id, hold = hold.Id, act, reason = why });
+            lines.Add($"HOLD: {act ?? "unclear request"}");
+            await Ping(hold, first: true);
+            _ = Task.Run(() => Remind(hold));
         }
-
-        var hold = new Hold(
-            Id: Guid.NewGuid().ToString("N")[..12],
-            Token: Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant(),
-            Message: m, Act: c.Act, Candidates: c.Acts, Reason: reason, CreatedAt: DateTimeOffset.UtcNow);
-        store.Holds[hold.Id] = hold;
-        store.Event("held", new { m.Id, hold = hold.Id, act = c.Act, candidates = c.Acts, reason });
-        var what = c.Act is not null ? c.Act : "this request";
-        await Reply(m, $"HELD {what}: this needs my human's approval. I have pinged them and will answer here when they decide.");
-        await Ping(hold, first: true);
-        _ = Task.Run(() => Remind(hold));
+        await Reply(m, string.Join("\n", lines));
     }
     catch (Exception e)
     {
@@ -203,16 +211,17 @@ app.MapPost("/approve/{id}", async (string id, HttpRequest req) =>
         h.State = decision == "approve" ? "approved" : "declined";
         h.Code = code; h.DecidedAct = act; h.DecidedAt = DateTimeOffset.UtcNow;
     }
+    store.SaveHolds();
     store.Event("decided", new { hold = h.Id, h.State, act, code = Mask(code), latencySec = (int)(h.DecidedAt!.Value - h.CreatedAt).TotalSeconds });
     if (h.State == "approved")
     {
         var result = Acts.Run(act, h.Message.Text);
         store.Event("act", new { h.Message.Id, act, by = "agent (approved by human)", result });
-        await Reply(h.Message, $"DONE {act}: {result} Approved by my human. Code: {code}");
+        await Reply(h.Message, $"DONE: {act} CODE: {code}");
     }
     else
     {
-        await Reply(h.Message, $"DECLINED {h.Act ?? "this request"}: my human said no, so I did not run it.");
+        await Reply(h.Message, $"DECLINED: {h.Act ?? "unclear request"} (my human said no)");
     }
     return Results.Content(Html.Done(h), "text/html; charset=utf-8");
 });
@@ -240,8 +249,25 @@ app.MapPost("/admin/cancel/{id}", (string id, HttpRequest req) =>
     if (!IsAdmin(req)) return Results.StatusCode(401);
     if (!store.Holds.TryGetValue(id, out var h)) return Results.NotFound();
     lock (h) { if (h.State == "held") h.State = "cancelled"; }
+    store.SaveHolds();
     store.Event("cancelled", new { hold = id, h.State });
     return Results.Ok(new { h.Id, h.State });
+});
+app.MapPost("/admin/hold", async (HttpRequest req) =>
+{
+    if (!IsAdmin(req)) return Results.StatusCode(401);
+    var j = await JsonNode.ParseAsync(req.Body) as JsonObject;
+    var act = j?["act"]?.ToString();
+    if (j is null || act is null || !Policy.Map.ContainsKey(act)) return Results.BadRequest();
+    var m = new CourseMessage(j["messageId"]?.ToString() ?? "manual", j["from"]?.ToString() ?? "", j["subject"]?.ToString() ?? "",
+        j["text"]?.ToString() ?? "", j["replyUrl"]?.ToString() ?? "", DateTimeOffset.UtcNow, "");
+    var hold = new Hold(Guid.NewGuid().ToString("N")[..12], Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant(),
+        m, act, new[] { act }, "policy: gated", DateTimeOffset.UtcNow);
+    store.AddHold(hold);
+    store.Event("held", new { m.Id, hold = hold.Id, act, reason = "re-created by admin after redeploy" });
+    await Ping(hold, first: true);
+    _ = Task.Run(() => Remind(hold));
+    return Results.Ok(new { hold = hold.Id });
 });
 app.MapPost("/admin/ping-test", async (HttpRequest req) =>
 {
@@ -378,6 +404,7 @@ class Store
         _dir = dir; Directory.CreateDirectory(dir);
         var kf = Path.Combine(dir, "signing.key");
         if (File.Exists(kf)) _key = File.ReadAllText(kf).Trim();
+        LoadHolds();
     }
     public string? SigningKey
     {
@@ -389,6 +416,18 @@ class Store
         var line = JsonSerializer.Serialize(new { at = DateTimeOffset.UtcNow, kind, data });
         Console.WriteLine(line);
         lock (_lock) File.AppendAllText(Path.Combine(_dir, "events.jsonl"), line + "\n");
+    }
+    public void AddHold(Hold h) { Holds[h.Id] = h; SaveHolds(); }
+    public void SaveHolds()
+    {
+        lock (_lock) File.WriteAllText(Path.Combine(_dir, "holds.json"), JsonSerializer.Serialize(Holds.Values.ToList()));
+    }
+    public void LoadHolds()
+    {
+        var f = Path.Combine(_dir, "holds.json");
+        if (!File.Exists(f)) return;
+        try { foreach (var h in JsonSerializer.Deserialize<List<Hold>>(File.ReadAllText(f)) ?? new()) Holds[h.Id] = h; }
+        catch (Exception e) { Console.WriteLine("holds load failed: " + e.Message); }
     }
     public string ReadLog() { lock (_lock) { var f = Path.Combine(_dir, "events.jsonl"); return File.Exists(f) ? File.ReadAllText(f) : ""; } }
 }
